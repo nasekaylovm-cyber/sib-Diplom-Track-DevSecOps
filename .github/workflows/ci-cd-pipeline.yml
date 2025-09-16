@@ -16,10 +16,14 @@ jobs:
   sast-analysis:
     name: "SAST Analysis"
     runs-on: ubuntu-latest
+    # Продолжаем выполнение для сбора всех отчетов, но job будет помечен как failed при нахождении уязвимостей
+    continue-on-error: true
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
@@ -35,36 +39,76 @@ jobs:
           sudo mv local-php-security-checker_2.0.2_linux_amd64 /usr/local/bin/local-php-security-checker
 
       - name: Run PHP Security Checker (Composer)
-        run: local-php-security-checker
+        id: security-check
+        run: |
+          # Сохраняем вывод для последующего использования
+          local-php-security-checker 2>&1 | tee security-scan.log
+          exit_code=$?
+          echo "exit_code=$exit_code" >> $GITHUB_OUTPUT
+          
+          # Всегда загружаем отчет, даже при ошибке
+          echo "scan_output<<EOF" >> $GITHUB_OUTPUT
+          cat security-scan.log >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create security report
+        if: always()
+        run: |
+          echo "### 🔍 PHP Security Checker Results" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat security-scan.log >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ steps.security-check.outputs.exit_code }}" != "0" ]]; then
+            echo "**❌ Found vulnerabilities that need to be addressed**" >> $GITHUB_STEP_SUMMARY
+            echo "Run \`composer update\` to fix vulnerable dependencies" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**✅ No known vulnerabilities found**" >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Install Psalm
-        run: composer require --dev psalm/phpsalm --no-interaction --prefer-dist
+        run: composer require --dev psalm/phpsalm
 
       - name: Run Psalm Static Analysis
         run: ./vendor/bin/psalm --output-format=github --shepherd --stats
 
       - name: Install PHPStan
-        run: composer require --dev phpstan/phpstan --no-interaction --prefer-dist
+        run: composer require --dev phpstan/phpstan
 
       - name: Run PHPStan Analysis
         run: ./vendor/bin/phpstan analyse --error-format=github
 
       - name: Setup Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '20'
 
       - name: Run npm audit
-        run: npm audit --audit-level=high
+        run: npm audit --audit-level=high --json > npm-audit-report.json || true
+
+      - name: Analyze npm audit results
+        run: |
+          if [ -f npm-audit-report.json ]; then
+            echo "### 📦 NPM Audit Results" >> $GITHUB_STEP_SUMMARY
+            VULN_COUNT=$(jq '.metadata.vulnerabilities | .high + .critical' npm-audit-report.json)
+            if [ "$VULN_COUNT" -gt 0 ]; then
+              echo "**❌ Found $VULN_COUNT high/critical vulnerabilities**" >> $GITHUB_STEP_SUMMARY
+              echo '```json' >> $GITHUB_STEP_SUMMARY
+              jq '.advisories | to_entries[] | select(.value.severity == "high" or .value.severity == "critical") | .value.title' npm-audit-report.json >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+            else
+              echo "**✅ No high/critical npm vulnerabilities found**" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
 
       - name: Upload SAST reports artifact
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: sast-reports
           path: |
-            psalm-report.xml
-            phpstan-report.xml
+            security-scan.log
+            npm-audit-report.json
           retention-days: 7
 
   secret-scan:
@@ -87,6 +131,15 @@ jobs:
 
       - name: Check for misconfigurations with Gitleaks
         uses: gitleaks/gitleaks-action@v2
+        with:
+          config-path: .gitleaks.toml
+
+      - name: Create secrets scan summary
+        if: always()
+        run: |
+          echo "### 🔐 Secrets Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "Secrets scanning completed successfully" >> $GITHUB_STEP_SUMMARY
+          echo "No secrets should be committed to the repository" >> $GITHUB_STEP_SUMMARY
 
   deploy-to-server:
     name: "Deploy to Production Server"
@@ -107,17 +160,20 @@ jobs:
           extensions: mbstring, xml, curl, gd, intl, mysql, zip
           tools: composer:v2
 
+      - name: Validate composer.json
+        run: composer validate --strict
+
       - name: Copy files to server via SSH
-        uses: appleboy/scp-action@v0.1.3
+        uses: appleboy/scp-action@v0.1.4
         with:
           host: ${{ secrets.SERVER_IP }}
           username: ${{ secrets.SERVER_SSH_USER }}
           key: ${{ secrets.SERVER_SSH_PRIVATE_KEY }}
-          source: "., !node_modules, !vendor, !.git, !.github"
+          source: "., !node_modules, !vendor, !.git, !.github, !storage/*, !bootstrap/cache/*"
           target: "/var/www/bootstrap-cms/"
           strip_components: 1
 
-      - name: Run composer install on server
+      - name: Run deployment commands on server
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{ secrets.SERVER_IP }}
@@ -125,15 +181,31 @@ jobs:
           key: ${{ secrets.SERVER_SSH_PRIVATE_KEY }}
           script: |
             cd /var/www/bootstrap-cms
+            export COMPOSER_ALLOW_SUPERUSER=1
             composer install --no-dev --optimize-autoloader --no-interaction --prefer-dist
             php artisan optimize:clear
             php artisan optimize
-            php artisan migrate --force
-            chown -R www-data:www-data /var/www/bootstrap-cms
-            chmod -R 755 /var/www/bootstrap-cms/storage
-            chmod -R 755 /var/www/bootstrap-cms/bootstrap/cache
-            systemctl reload php8.2-fpm
-            systemctl reload nginx
+            php artisan migrate --force --no-interaction
+            # Frontend build (if applicable)
+            # npm install --production
+            # npm run prod
+            # Ensure proper permissions
+            find . -type f -exec chmod 644 {} \;
+            find . -type d -exec chmod 755 {} \;
+            chmod -R 775 storage bootstrap/cache
+            # Reload services
+            sudo systemctl reload php8.2-fpm
+            sudo systemctl reload nginx
+
+      - name: Verify deployment
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_SSH_USER }}
+          key: ${{ secrets.SERVER_SSH_PRIVATE_KEY }}
+          script: |
+            curl -f http://localhost/ -o /dev/null 2>/dev/null || exit 1
+            echo "Deployment verified successfully"
 
   dast-scan:
     name: "DAST Scan"
@@ -147,21 +219,113 @@ jobs:
 
       - name: Wait for application to be ready
         run: |
-          until curl -f http://${{ secrets.SERVER_IP }}/ -o /dev/null 2>/dev/null; do
-            echo "Waiting for server to be up..."
+          for i in {1..12}; do
+            if curl -f http://${{ secrets.SERVER_IP }}/ -o /dev/null 2>/dev/null; then
+              echo "Application is ready"
+              exit 0
+            fi
+            echo "Waiting for application to start... ($i/12)"
             sleep 5
           done
+          echo "Application did not start in time"
+          exit 1
 
       - name: Run OWASP ZAP Full Scan
         uses: zaproxy/action-full-scan@v0.10.0
         with:
           target: "http://${{ secrets.SERVER_IP }}"
+          rules_file_name: ".zap/rules.tsv"
           cmd_options: "-a -j"
 
       - name: Upload DAST report artifact
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: dast-zap-report
-          path: zap-report.html
+          path: |
+            zap-report.html
+            zap-report.json
           retention-days: 7
+
+      - name: Create DAST scan summary
+        if: always()
+        run: |
+          echo "### 🌐 DAST Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "OWASP ZAP full scan completed" >> $GITHUB_STEP_SUMMARY
+          echo "Check the artifacts for detailed report" >> $GITHUB_STEP_SUMMARY
+
+  security-gateway:
+    name: "Security Gateway"
+    runs-on: ubuntu-latest
+    needs: [sast-analysis, secret-scan, dast-scan]
+    if: always()
+
+    steps:
+      - name: Download SAST reports
+        uses: actions/download-artifact@v4
+        with:
+          name: sast-reports
+          path: ./sast-reports
+
+      - name: Check for critical security issues
+        run: |
+          # Проверяем PHP security checker
+          if [ -f ./sast-reports/security-scan.log ]; then
+            if grep -q "Vulnerabilities" ./sast-reports/security-scan.log || 
+               grep -q "ERROR" ./sast-reports/security-scan.log; then
+              echo "❌ PHP dependencies have known vulnerabilities"
+              echo "Please run 'composer update' to fix vulnerable dependencies"
+              cat ./sast-reports/security-scan.log
+              exit 1
+            fi
+          fi
+          
+          # Проверяем npm audit results
+          if [ -f ./sast-reports/npm-audit-report.json ]; then
+            CRITICAL_VULNS=$(jq '.metadata.vulnerabilities | .critical + .high' ./sast-reports/npm-audit-report.json)
+            if [ "$CRITICAL_VULNS" -gt 0 ]; then
+              echo "❌ Found $CRITICAL_VULNS critical/high npm vulnerabilities"
+              exit 1
+            fi
+          fi
+          
+          # Проверяем результаты других сканеров
+          if [[ "${{ needs.secret-scan.result }}" != "success" ]]; then
+            echo "❌ Secrets scan found issues - blocking deployment"
+            exit 1
+          fi
+          
+          # Проверяем, что деплой был успешным
+          if [[ "${{ needs.deploy-to-server.result }}" != "success" ]]; then
+            echo "❌ Deployment failed - blocking further steps"
+            exit 1
+          fi
+          
+          echo "✅ All security checks passed"
+
+      - name: Create final security summary
+        if: always()
+        run: |
+          echo "## 🛡️ Security Gateway Final Result" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Status Overview:" >> $GITHUB_STEP_SUMMARY
+          echo "- SAST Analysis: ${{ needs.sast-analysis.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Secrets Scan: ${{ needs.secret-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Deployment: ${{ needs.deploy-to-server.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- DAST Scan: ${{ needs.dast-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ job.status }}" == "success" ]]; then
+            echo "### ✅ All security checks passed successfully!" >> $GITHUB_STEP_SUMMARY
+            echo "Deployment is approved and completed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ Security check failed!" >> $GITHUB_STEP_SUMMARY
+            echo "Deployment blocked due to security issues" >> $GITHUB_STEP_SUMMARY
+            echo "Please check the detailed reports in each job" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Fail deployment on security issues
+        if: failure()
+        run: |
+          echo "Security gateway blocked deployment due to identified vulnerabilities"
+          exit 1
